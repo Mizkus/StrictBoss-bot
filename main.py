@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
+from dateutil.rrule import rrulestr
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -109,6 +110,7 @@ class DB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 event_at TEXT NOT NULL,
+                end_at TEXT,
                 action_text TEXT NOT NULL,
                 week_start TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -145,6 +147,8 @@ class DB:
         event_columns = {row[1] for row in cur.fetchall()}
         if "source" not in event_columns:
             cur.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        if "end_at" not in event_columns:
+            cur.execute("ALTER TABLE events ADD COLUMN end_at TEXT")
         self.conn.commit()
 
     def set_default_fine_if_missing(self, value: int) -> None:
@@ -188,15 +192,18 @@ class DB:
         self.conn.commit()
 
     def insert_events(
-        self, user_id: int, events: Iterable[tuple[datetime, str]], source: str = "manual"
+        self,
+        user_id: int,
+        events: Iterable[tuple[datetime, Optional[datetime], str]],
+        source: str = "manual",
     ) -> list[int]:
         cur = self.conn.cursor()
         ids: list[int] = []
-        for event_at, action in events:
+        for event_at, end_at, action in events:
             week_start = (event_at.date() - timedelta(days=event_at.weekday())).isoformat()
             cur.execute(
-                "INSERT INTO events (user_id, event_at, action_text, week_start, source) VALUES (?, ?, ?, ?, ?)",
-                (user_id, event_at.isoformat(), action, week_start, source),
+                "INSERT INTO events (user_id, event_at, end_at, action_text, week_start, source) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, event_at.isoformat(), end_at.isoformat() if end_at else None, action, week_start, source),
             )
             ids.append(cur.lastrowid)
         self.conn.commit()
@@ -376,8 +383,42 @@ def get_partner_id(cfg: Config, user_id: int) -> int:
     return b if user_id == a else a
 
 
-def parse_calendar_lines(text: str, tz: ZoneInfo) -> list[tuple[datetime, str]]:
-    events: list[tuple[datetime, str]] = []
+def parse_time_range(left: str, now_year: int, tz: ZoneInfo) -> tuple[datetime, Optional[datetime]]:
+    left = left.strip().replace("–", "-").replace("—", "-")
+    for fmt in ("%Y-%m-%d %H:%M", "%d.%m %H:%M"):
+        try:
+            dt = datetime.strptime(left, fmt)
+            if fmt == "%d.%m %H:%M":
+                dt = dt.replace(year=now_year)
+            return dt.replace(tzinfo=tz), None
+        except ValueError:
+            continue
+
+    for date_fmt in ("%Y-%m-%d", "%d.%m"):
+        try:
+            date_part, time_range = left.split(" ", 1)
+            start_raw, end_raw = [p.strip() for p in time_range.split("-", 1)]
+            date_obj = datetime.strptime(date_part, date_fmt)
+            if date_fmt == "%d.%m":
+                date_obj = date_obj.replace(year=now_year)
+            start_t = datetime.strptime(start_raw, "%H:%M").time()
+            end_t = datetime.strptime(end_raw, "%H:%M").time()
+            start_dt = datetime.combine(date_obj.date(), start_t, tzinfo=tz)
+            end_dt = datetime.combine(date_obj.date(), end_t, tzinfo=tz)
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
+            return start_dt, end_dt
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "дата/время должны быть в формате YYYY-MM-DD HH:MM, DD.MM HH:MM "
+        "или с диапазоном YYYY-MM-DD HH:MM-HH:MM"
+    )
+
+
+def parse_calendar_lines(text: str, tz: ZoneInfo) -> list[tuple[datetime, Optional[datetime], str]]:
+    events: list[tuple[datetime, Optional[datetime], str]] = []
     now_year = datetime.now(tz).year
     for idx, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
@@ -391,21 +432,11 @@ def parse_calendar_lines(text: str, tz: ZoneInfo) -> list[tuple[datetime, str]]:
         if not action:
             raise ValueError(f"Строка {idx}: пустое действие")
 
-        parsed: Optional[datetime] = None
-        for fmt in ("%Y-%m-%d %H:%M", "%d.%m %H:%M"):
-            try:
-                dt = datetime.strptime(left, fmt)
-                if fmt == "%d.%m %H:%M":
-                    dt = dt.replace(year=now_year)
-                parsed = dt.replace(tzinfo=tz)
-                break
-            except ValueError:
-                continue
-        if parsed is None:
-            raise ValueError(
-                f"Строка {idx}: дата должна быть в формате YYYY-MM-DD HH:MM или DD.MM HH:MM"
-            )
-        events.append((parsed, action))
+        try:
+            start_dt, end_dt = parse_time_range(left, now_year, tz)
+        except ValueError as exc:
+            raise ValueError(f"Строка {idx}: {exc}") from exc
+        events.append((start_dt, end_dt, action))
     if not events:
         raise ValueError("Календарь пустой")
     return events
@@ -435,31 +466,95 @@ def parse_ics_dt(raw: str, tzid: Optional[str], default_tz: ZoneInfo) -> datetim
     return dt.replace(tzinfo=tz)
 
 
-def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, str]]:
+def parse_ics_duration(raw: str) -> Optional[timedelta]:
+    value = raw.strip()
+    if not value.startswith("P"):
+        return None
+    if "T" not in value:
+        return None
+    date_part, time_part = value[1:].split("T", 1)
+    if date_part:
+        return None
+
+    hours = 0
+    minutes = 0
+    seconds = 0
+    token = ""
+    for ch in time_part:
+        if ch.isdigit():
+            token += ch
+            continue
+        if not token:
+            return None
+        n = int(token)
+        token = ""
+        if ch == "H":
+            hours = n
+        elif ch == "M":
+            minutes = n
+        elif ch == "S":
+            seconds = n
+        else:
+            return None
+    if token:
+        return None
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, Optional[datetime], str]]:
     try:
         content = ics_bytes.decode("utf-8")
     except UnicodeDecodeError:
         content = ics_bytes.decode("utf-8-sig", errors="replace")
 
     lines = unfold_ics_lines(content)
-    events: list[tuple[datetime, str]] = []
+    events: list[tuple[datetime, Optional[datetime], str]] = []
     in_event = False
     dtstart_raw: Optional[str] = None
     dtstart_tzid: Optional[str] = None
+    dtend_raw: Optional[str] = None
+    dtend_tzid: Optional[str] = None
+    duration_raw: Optional[str] = None
+    rrule_raw: Optional[str] = None
     summary = ""
+    now = datetime.now(tz)
+    window_start = datetime.combine(now.date(), time.min, tzinfo=tz)
+    window_end = window_start + timedelta(days=7)
 
     for line in lines:
         if line == "BEGIN:VEVENT":
             in_event = True
             dtstart_raw = None
             dtstart_tzid = None
+            dtend_raw = None
+            dtend_tzid = None
+            duration_raw = None
+            rrule_raw = None
             summary = ""
             continue
         if line == "END:VEVENT":
             if dtstart_raw:
                 event_dt = parse_ics_dt(dtstart_raw, dtstart_tzid, tz)
+                end_dt = parse_ics_dt(dtend_raw, dtend_tzid, tz) if dtend_raw else None
+                if end_dt is None and duration_raw:
+                    duration = parse_ics_duration(duration_raw)
+                    if duration:
+                        end_dt = event_dt + duration
                 action = summary.strip() or "Событие"
-                events.append((event_dt, action))
+                if rrule_raw:
+                    duration_delta = (end_dt - event_dt) if end_dt else None
+                    try:
+                        rule = rrulestr(rrule_raw, dtstart=event_dt)
+                        occ_starts = rule.between(window_start, window_end, inc=True)
+                        for occ_start in occ_starts:
+                            if occ_start.tzinfo is None:
+                                occ_start = occ_start.replace(tzinfo=event_dt.tzinfo)
+                            occ_end = occ_start + duration_delta if duration_delta else None
+                            events.append((occ_start, occ_end, action))
+                    except Exception:
+                        events.append((event_dt, end_dt, action))
+                else:
+                    events.append((event_dt, end_dt, action))
             in_event = False
             continue
         if not in_event:
@@ -474,6 +569,19 @@ def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, s
                     if p.startswith("TZID="):
                         dtstart_tzid = p.split("=", 1)[1]
                         break
+        elif line.startswith("DTEND"):
+            head, _, value = line.partition(":")
+            dtend_raw = value.strip()
+            if ";" in head:
+                params = head.split(";")[1:]
+                for p in params:
+                    if p.startswith("TZID="):
+                        dtend_tzid = p.split("=", 1)[1]
+                        break
+        elif line.startswith("DURATION:"):
+            duration_raw = line.split(":", 1)[1].strip()
+        elif line.startswith("RRULE:"):
+            rrule_raw = line.split(":", 1)[1].strip()
         elif line.startswith("SUMMARY:"):
             summary = line.split(":", 1)[1].strip()
 
@@ -493,22 +601,38 @@ def format_day_tasks(
 
     lines = [f"{title} ({day_start.strftime('%Y-%m-%d')}):"]
     for row in rows:
-        event_dt = datetime.fromisoformat(row["event_at"]).astimezone(tz)
-        lines.append(f"- {event_dt.strftime('%H:%M')} {row['action_text']} [{row['status']}]")
+        lines.append(f"- {format_event_window(row['event_at'], row['end_at'], tz)} {row['action_text']}")
     return "\n".join(lines)
 
 
-def validate_single_week(events: list[tuple[datetime, str]]) -> str:
-    weeks = {
-        (event_dt.date() - timedelta(days=event_dt.weekday())).isoformat()
-        for event_dt, _ in events
-    }
-    if len(weeks) != 1:
-        raise ValueError(
-            "Календарь должен содержать события только одной недели. "
-            "Разбей загрузку по неделям и отправь одну неделю за раз."
-        )
-    return next(iter(weeks))
+def split_events_by_week(
+    events: list[tuple[datetime, Optional[datetime], str]]
+) -> dict[str, list[tuple[datetime, Optional[datetime], str]]]:
+    grouped: dict[str, list[tuple[datetime, Optional[datetime], str]]] = {}
+    for event_dt, end_dt, action in events:
+        week_start = (event_dt.date() - timedelta(days=event_dt.weekday())).isoformat()
+        grouped.setdefault(week_start, []).append((event_dt, end_dt, action))
+    return grouped
+
+
+def filter_ics_to_actual_week(
+    events: list[tuple[datetime, Optional[datetime], str]], now: datetime, tz: ZoneInfo
+) -> list[tuple[datetime, Optional[datetime], str]]:
+    start = datetime.combine(now.date(), time.min, tzinfo=tz)
+    end = start + timedelta(days=7)
+    return [
+        (event_dt, end_dt, action)
+        for event_dt, end_dt, action in events
+        if start <= event_dt < end
+    ]
+
+
+def format_event_window(event_at_iso: str, end_at_iso: Optional[str], tz: ZoneInfo) -> str:
+    start_dt = datetime.fromisoformat(event_at_iso).astimezone(tz)
+    if not end_at_iso:
+        return start_dt.strftime("%H:%M")
+    end_dt = datetime.fromisoformat(end_at_iso).astimezone(tz)
+    return f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
 
 
 def format_stats(db: DB, user_id: int) -> str:
@@ -594,13 +718,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Загрузка календаря:\n"
         "1) Текстом, каждая строка отдельно:\n"
         "YYYY-MM-DD HH:MM | Действие\n"
+        "или YYYY-MM-DD HH:MM-HH:MM | Действие\n"
         "или\n"
         "DD.MM HH:MM | Действие\n"
+        "или DD.MM HH:MM-HH:MM | Действие\n"
         "2) Файлом .ics (экспорт из календаря)\n\n"
         "Пример:\n"
         "2026-02-16 08:00 | Зарядка\n"
-        "16.02 22:30 | Отбой\n\n"
-        "Важно: загружай только одну неделю за раз.\n"
+        "16.02 09:00-10:30 | Тренировка\n\n"
+        "Если отправишь несколько недель сразу, бот сам разложит их по неделям.\n"
         "Если расписание не изменилось, можно не загружать заново."
     )
 
@@ -608,9 +734,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @allowed_only
 async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "Отправь календарь на неделю:\n"
-        "- текстом (YYYY-MM-DD HH:MM | Действие)\n"
+        "Отправь календарь:\n"
+        "- текстом (YYYY-MM-DD HH:MM | Действие или HH:MM-HH:MM)\n"
         "- или файлом .ics\n\n"
+        "Можно отправить сразу несколько недель, бот сам разобьет и сохранит.\n"
         "Если календарь остался прежним, можно ничего не отправлять.\n"
         "Текущий календарь сохранится."
     )
@@ -620,19 +747,24 @@ async def upload_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def save_uploaded_events(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    events: list[tuple[datetime, str]],
+    events: list[tuple[datetime, Optional[datetime], str]],
 ) -> int:
     cfg: Config = context.bot_data["config"]
     db: DB = context.bot_data["db"]
     user_id = update.effective_user.id
-    week_start = validate_single_week(events)
+    grouped = split_events_by_week(events)
 
-    db.clear_week_events(user_id, week_start)
-    event_ids = db.insert_events(user_id, events)
-    for event_id, (event_dt, action) in zip(event_ids, events):
-        schedule_event_notification(context.application, cfg, event_id, event_dt, action)
+    week_count = 0
+    for week_start, week_events in sorted(grouped.items()):
+        db.clear_week_events(user_id, week_start)
+        event_ids = db.insert_events(user_id, week_events)
+        for event_id, (event_dt, _end_dt, action) in zip(event_ids, week_events):
+            schedule_event_notification(context.application, cfg, event_id, event_dt, action)
+        week_count += 1
 
-    await update.message.reply_text(f"Сохранено событий: {len(events)}")
+    await update.message.reply_text(
+        f"Сохранено событий: {len(events)}\nОбновлено недель: {week_count}"
+    )
     return ConversationHandler.END
 
 
@@ -649,7 +781,13 @@ async def upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         payload = await file.download_as_bytearray()
         try:
             events = parse_ics_calendar(bytes(payload), cfg.timezone)
-            validate_single_week(events)
+            now = datetime.now(cfg.timezone)
+            events = filter_ics_to_actual_week(events, now, cfg.timezone)
+            if not events:
+                await update.message.reply_text(
+                    "В .ics нет актуальных событий на период от текущего дня до +7 дней."
+                )
+                return UPLOAD_CALENDAR
         except ValueError as exc:
             await update.message.reply_text(f"Ошибка .ics: {exc}")
             return UPLOAD_CALENDAR
@@ -658,7 +796,6 @@ async def upload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text or ""
     try:
         events = parse_calendar_lines(text, cfg.timezone)
-        validate_single_week(events)
     except ValueError as exc:
         await update.message.reply_text(f"Ошибка: {exc}")
         return UPLOAD_CALENDAR
@@ -831,7 +968,7 @@ async def send_event_notification_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     owner_id = int(event["user_id"])
     partner_id = get_partner_id(cfg, owner_id)
     action = event["action_text"]
-    event_at = datetime.fromisoformat(event["event_at"]).astimezone(cfg.timezone)
+    window = format_event_window(event["event_at"], event["end_at"], cfg.timezone)
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -842,7 +979,7 @@ async def send_event_notification_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     text = (
         f"Проверка события {db.get_user_name(owner_id)}:\n"
-        f"{event_at.strftime('%Y-%m-%d %H:%M')} - {action}\n"
+        f"{window} - {action}\n"
         "Соблюдает график?"
     )
     await context.bot.send_message(chat_id=partner_id, text=text, reply_markup=keyboard)
@@ -880,13 +1017,13 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     action = event["action_text"]
-    event_dt = datetime.fromisoformat(event["event_at"]).astimezone(cfg.timezone)
+    window = format_event_window(event["event_at"], event["end_at"], cfg.timezone)
     if compliant:
         await context.bot.send_message(
             chat_id=owner_id,
             text=(
                 f"Событие отмечено как выполненное: "
-                f"{event_dt.strftime('%Y-%m-%d %H:%M')} - {action}"
+                f"{window} - {action}"
             ),
         )
         await query.message.reply_text("Отметка сохранена: соблюдает график.")
@@ -897,7 +1034,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await context.bot.send_message(
         chat_id=owner_id,
         text=(
-            f"Нарушение: {event_dt.strftime('%Y-%m-%d %H:%M')} - {action}\n"
+            f"Нарушение: {window} - {action}\n"
             f"Штраф: {fine} руб.\n"
             "Нужно пополнить счёт и закрыть долг."
         ),
@@ -932,12 +1069,12 @@ async def mark_expired_events_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         reviewer_id = get_partner_id(cfg, owner_id)
         action = event["action_text"]
         db.create_violation(owner_id, int(event["id"]), reviewer_id, action, fine)
-        event_dt = datetime.fromisoformat(event["event_at"]).astimezone(cfg.timezone)
+        window = format_event_window(event["event_at"], event["end_at"], cfg.timezone)
         await context.bot.send_message(
             chat_id=owner_id,
             text=(
                 f"Событие не было подтверждено вовремя и засчитано как нарушение:\n"
-                f"{event_dt.strftime('%Y-%m-%d %H:%M')} - {action}\n"
+                f"{window} - {action}\n"
                 f"Штраф: {fine} руб."
             ),
         )
