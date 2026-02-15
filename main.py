@@ -114,7 +114,8 @@ class DB:
                 action_text TEXT NOT NULL,
                 week_start TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
-                source TEXT NOT NULL DEFAULT 'manual'
+                source TEXT NOT NULL DEFAULT 'manual',
+                notified_at TEXT
             )
             """
         )
@@ -149,6 +150,8 @@ class DB:
             cur.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         if "end_at" not in event_columns:
             cur.execute("ALTER TABLE events ADD COLUMN end_at TEXT")
+        if "notified_at" not in event_columns:
+            cur.execute("ALTER TABLE events ADD COLUMN notified_at TEXT")
         self.conn.commit()
 
     def set_default_fine_if_missing(self, value: int) -> None:
@@ -217,10 +220,23 @@ class DB:
     def get_pending_future_events(self, now: datetime) -> list[sqlite3.Row]:
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT * FROM events WHERE status='pending' AND event_at >= ?",
+            "SELECT * FROM events WHERE status='pending' AND notified_at IS NULL AND event_at >= ?",
             (now.isoformat(),),
         )
         return cur.fetchall()
+
+    def try_mark_event_notified(self, event_id: int) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE events
+            SET notified_at=?
+            WHERE id=? AND status='pending' AND notified_at IS NULL
+            """,
+            (datetime.utcnow().isoformat(), event_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
 
     def has_active_calendar(self, user_id: int, now: datetime) -> bool:
         cur = self.conn.cursor()
@@ -1079,6 +1095,10 @@ async def send_event_notification_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     event_id = context.job.data["event_id"]
     event = db.get_event(event_id)
     if not event or event["status"] != "pending":
+        return
+    if event["notified_at"] is not None:
+        return
+    if not db.try_mark_event_notified(event_id):
         return
 
     owner_id = int(event["user_id"])
