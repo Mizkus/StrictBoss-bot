@@ -235,7 +235,7 @@ class DB:
         cur.execute(
             """
             SELECT * FROM events
-            WHERE user_id=? AND event_at >= ? AND event_at < ?
+            WHERE user_id=? AND status='pending' AND event_at >= ? AND event_at < ?
             ORDER BY event_at
             """,
             (user_id, day_start.isoformat(), day_end.isoformat()),
@@ -501,6 +501,15 @@ def parse_ics_duration(raw: str) -> Optional[timedelta]:
     return timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
 
+def parse_ics_datetime_list(raw: str, tzid: Optional[str], tz: ZoneInfo) -> list[datetime]:
+    values = [v.strip() for v in raw.split(",") if v.strip()]
+    return [parse_ics_dt(v, tzid, tz) for v in values]
+
+
+def normalize_ics_dt_key(dt: datetime, tz: ZoneInfo) -> datetime:
+    return dt.astimezone(tz).replace(second=0, microsecond=0)
+
+
 def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, Optional[datetime], str]]:
     try:
         content = ics_bytes.decode("utf-8")
@@ -510,30 +519,74 @@ def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, O
     lines = unfold_ics_lines(content)
     events: list[tuple[datetime, Optional[datetime], str]] = []
     in_event = False
+    uid: Optional[str] = None
     dtstart_raw: Optional[str] = None
     dtstart_tzid: Optional[str] = None
     dtend_raw: Optional[str] = None
     dtend_tzid: Optional[str] = None
     duration_raw: Optional[str] = None
     rrule_raw: Optional[str] = None
+    exdates: list[datetime] = []
+    recurrence_id_raw: Optional[str] = None
+    recurrence_id_tzid: Optional[str] = None
+    status_value: str = ""
     summary = ""
     now = datetime.now(tz)
     window_start = datetime.combine(now.date(), time.min, tzinfo=tz)
     window_end = window_start + timedelta(days=7)
+    cancelled_recurrences: set[tuple[str, datetime]] = set()
+    overridden_recurrences: set[tuple[str, datetime]] = set()
+    recurring_events: list[
+        tuple[str, datetime, Optional[datetime], str, str, list[datetime]]
+    ] = []
 
     for line in lines:
         if line == "BEGIN:VEVENT":
             in_event = True
+            uid = None
             dtstart_raw = None
             dtstart_tzid = None
             dtend_raw = None
             dtend_tzid = None
             duration_raw = None
             rrule_raw = None
+            exdates = []
+            recurrence_id_raw = None
+            recurrence_id_tzid = None
+            status_value = ""
             summary = ""
             continue
         if line == "END:VEVENT":
-            if dtstart_raw:
+            if dtstart_raw and uid:
+                event_dt = parse_ics_dt(dtstart_raw, dtstart_tzid, tz)
+                end_dt = parse_ics_dt(dtend_raw, dtend_tzid, tz) if dtend_raw else None
+                if end_dt is None and duration_raw:
+                    duration = parse_ics_duration(duration_raw)
+                    if duration:
+                        end_dt = event_dt + duration
+                action = summary.strip() or "Событие"
+                recurrence_key = None
+                if recurrence_id_raw:
+                    recurrence_dt = parse_ics_dt(recurrence_id_raw, recurrence_id_tzid, tz)
+                    recurrence_key = (uid, normalize_ics_dt_key(recurrence_dt, tz))
+                    if status_value.upper() == "CANCELLED":
+                        cancelled_recurrences.add(recurrence_key)
+                        in_event = False
+                        continue
+                    overridden_recurrences.add(recurrence_key)
+
+                if status_value.upper() == "CANCELLED" and not recurrence_id_raw:
+                    in_event = False
+                    continue
+
+                if rrule_raw and not recurrence_id_raw:
+                    recurring_events.append((uid, event_dt, end_dt, action, rrule_raw, exdates))
+                else:
+                    if recurrence_key:
+                        cancelled_recurrences.discard(recurrence_key)
+                    events.append((event_dt, end_dt, action))
+            elif dtstart_raw and not uid:
+                # Some calendars omit UID, keep backward-compatible behavior.
                 event_dt = parse_ics_dt(dtstart_raw, dtstart_tzid, tz)
                 end_dt = parse_ics_dt(dtend_raw, dtend_tzid, tz) if dtend_raw else None
                 if end_dt is None and duration_raw:
@@ -542,13 +595,12 @@ def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, O
                         end_dt = event_dt + duration
                 action = summary.strip() or "Событие"
                 if rrule_raw:
-                    duration_delta = (end_dt - event_dt) if end_dt else None
                     try:
                         rule = rrulestr(rrule_raw, dtstart=event_dt)
-                        occ_starts = rule.between(window_start, window_end, inc=True)
-                        for occ_start in occ_starts:
+                        for occ_start in rule.between(window_start, window_end, inc=True):
                             if occ_start.tzinfo is None:
                                 occ_start = occ_start.replace(tzinfo=event_dt.tzinfo)
+                            duration_delta = (end_dt - event_dt) if end_dt else None
                             occ_end = occ_start + duration_delta if duration_delta else None
                             events.append((occ_start, occ_end, action))
                     except Exception:
@@ -569,6 +621,8 @@ def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, O
                     if p.startswith("TZID="):
                         dtstart_tzid = p.split("=", 1)[1]
                         break
+        elif line.startswith("UID:"):
+            uid = line.split(":", 1)[1].strip()
         elif line.startswith("DTEND"):
             head, _, value = line.partition(":")
             dtend_raw = value.strip()
@@ -578,12 +632,54 @@ def parse_ics_calendar(ics_bytes: bytes, tz: ZoneInfo) -> list[tuple[datetime, O
                     if p.startswith("TZID="):
                         dtend_tzid = p.split("=", 1)[1]
                         break
+        elif line.startswith("EXDATE"):
+            head, _, value = line.partition(":")
+            ex_tzid: Optional[str] = None
+            if ";" in head:
+                params = head.split(";")[1:]
+                for p in params:
+                    if p.startswith("TZID="):
+                        ex_tzid = p.split("=", 1)[1]
+                        break
+            exdates.extend(parse_ics_datetime_list(value.strip(), ex_tzid, tz))
+        elif line.startswith("RECURRENCE-ID"):
+            head, _, value = line.partition(":")
+            recurrence_id_raw = value.strip()
+            if ";" in head:
+                params = head.split(";")[1:]
+                for p in params:
+                    if p.startswith("TZID="):
+                        recurrence_id_tzid = p.split("=", 1)[1]
+                        break
         elif line.startswith("DURATION:"):
             duration_raw = line.split(":", 1)[1].strip()
         elif line.startswith("RRULE:"):
             rrule_raw = line.split(":", 1)[1].strip()
+        elif line.startswith("STATUS:"):
+            status_value = line.split(":", 1)[1].strip()
         elif line.startswith("SUMMARY:"):
             summary = line.split(":", 1)[1].strip()
+
+    for rec_uid, event_dt, end_dt, action, rule_raw, exdate_values in recurring_events:
+        duration_delta = (end_dt - event_dt) if end_dt else None
+        exdate_keys = {normalize_ics_dt_key(d, tz) for d in exdate_values}
+        try:
+            rule = rrulestr(rule_raw, dtstart=event_dt)
+            occ_starts = rule.between(window_start, window_end, inc=True)
+            for occ_start in occ_starts:
+                if occ_start.tzinfo is None:
+                    occ_start = occ_start.replace(tzinfo=event_dt.tzinfo)
+                occ_key = (rec_uid, normalize_ics_dt_key(occ_start, tz))
+                if occ_key in cancelled_recurrences:
+                    continue
+                if occ_key in overridden_recurrences:
+                    continue
+                if normalize_ics_dt_key(occ_start, tz) in exdate_keys:
+                    continue
+                occ_end = occ_start + duration_delta if duration_delta else None
+                events.append((occ_start, occ_end, action))
+        except Exception:
+            events.append((event_dt, end_dt, action))
 
     if not events:
         raise ValueError("В .ics не найдено событий VEVENT с DTSTART")
@@ -613,6 +709,25 @@ def split_events_by_week(
         week_start = (event_dt.date() - timedelta(days=event_dt.weekday())).isoformat()
         grouped.setdefault(week_start, []).append((event_dt, end_dt, action))
     return grouped
+
+
+def deduplicate_events(
+    events: list[tuple[datetime, Optional[datetime], str]]
+) -> list[tuple[datetime, Optional[datetime], str]]:
+    # Keyed by exact start/end/action in bot timezone.
+    # If both variants exist (with and without end), keep the one with end.
+    by_key: dict[tuple[str, str], tuple[datetime, Optional[datetime], str]] = {}
+    for start_dt, end_dt, action in events:
+        start_key = start_dt.isoformat()
+        action_key = action.strip()
+        key = (start_key, action_key)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = (start_dt, end_dt, action_key)
+            continue
+        if existing[1] is None and end_dt is not None:
+            by_key[key] = (start_dt, end_dt, action_key)
+    return sorted(by_key.values(), key=lambda x: (x[0], x[2]))
 
 
 def filter_ics_to_actual_week(
@@ -752,7 +867,8 @@ async def save_uploaded_events(
     cfg: Config = context.bot_data["config"]
     db: DB = context.bot_data["db"]
     user_id = update.effective_user.id
-    grouped = split_events_by_week(events)
+    deduped_events = deduplicate_events(events)
+    grouped = split_events_by_week(deduped_events)
 
     week_count = 0
     for week_start, week_events in sorted(grouped.items()):
@@ -763,7 +879,7 @@ async def save_uploaded_events(
         week_count += 1
 
     await update.message.reply_text(
-        f"Сохранено событий: {len(events)}\nОбновлено недель: {week_count}"
+        f"Сохранено событий: {len(deduped_events)}\nОбновлено недель: {week_count}"
     )
     return ConversationHandler.END
 
