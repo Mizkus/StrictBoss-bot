@@ -26,6 +26,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+UTC = ZoneInfo("UTC")
 
 UPLOAD_CALENDAR = 1
 
@@ -344,6 +345,66 @@ class DB:
             """
         )
         return cur.fetchall()
+
+    def get_open_violations(self, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, action_text, fine_amount, created_at
+            FROM violations
+            WHERE user_id=? AND paid=0
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return cur.fetchall()
+
+    def get_violations_in_period(
+        self, user_id: int, start_utc_iso: str, end_utc_iso: str
+    ) -> list[sqlite3.Row]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, action_text, fine_amount, created_at
+            FROM violations
+            WHERE user_id=? AND created_at >= ? AND created_at < ?
+            ORDER BY created_at ASC
+            """,
+            (user_id, start_utc_iso, end_utc_iso),
+        )
+        return cur.fetchall()
+
+    def pay_violation(self, user_id: int, violation_id: int) -> bool:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE violations
+            SET paid=1
+            WHERE id=? AND user_id=? AND paid=0
+            """,
+            (violation_id, user_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def pay_all_violations(self, user_id: int) -> tuple[int, int]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS cnt, COALESCE(SUM(fine_amount),0) AS total FROM violations WHERE user_id=? AND paid=0",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        count = int(row["cnt"])
+        total = int(row["total"])
+        if count == 0:
+            return 0, 0
+        cur.execute(
+            "UPDATE violations SET paid=1 WHERE user_id=? AND paid=0",
+            (user_id,),
+        )
+        self.conn.commit()
+        return count, total
 
     def get_user_name(self, user_id: int) -> str:
         cur = self.conn.cursor()
@@ -766,6 +827,38 @@ def format_event_window(event_at_iso: str, end_at_iso: Optional[str], tz: ZoneIn
     return f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
 
 
+def to_utc_naive_iso(local_dt: datetime) -> str:
+    return local_dt.astimezone(UTC).replace(tzinfo=None).isoformat()
+
+
+def utc_naive_iso_to_local(utc_naive_iso: str, tz: ZoneInfo) -> datetime:
+    return datetime.fromisoformat(utc_naive_iso).replace(tzinfo=UTC).astimezone(tz)
+
+
+def format_weekly_violations_table(
+    db: DB, user_id: int, week_start_local: datetime, now_local: datetime, tz: ZoneInfo
+) -> str:
+    rows = db.get_violations_in_period(
+        user_id,
+        to_utc_naive_iso(week_start_local),
+        to_utc_naive_iso(now_local),
+    )
+    period = f"{week_start_local.strftime('%Y-%m-%d')} .. {now_local.strftime('%Y-%m-%d %H:%M')}"
+    title = f"Нарушения за неделю ({period})"
+    if not rows:
+        return f"{title}\nНет нарушений."
+
+    lines = [title, "Дата | Штраф | Действие"]
+    total = 0
+    for row in rows:
+        dt_local = utc_naive_iso_to_local(row["created_at"], tz)
+        fine = int(row["fine_amount"])
+        total += fine
+        lines.append(f"{dt_local.strftime('%d.%m %H:%M')} | {fine} руб | {row['action_text']}")
+    lines.append(f"Итого: {len(rows)} наруш., {total} руб")
+    return "\n".join(lines)
+
+
 def format_stats(db: DB, user_id: int) -> str:
     stats = db.get_user_stats(user_id)
     top = db.get_violations_breakdown(user_id)
@@ -793,6 +886,31 @@ def panel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def violations_keyboard(rows: list[sqlite3.Row], target_user_id: int) -> InlineKeyboardMarkup:
+    buttons = []
+    for row in rows:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Закрыть ID {row['id']} ({row['fine_amount']} руб)",
+                    callback_data=f"pay:{row['id']}:{target_user_id}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
+def parse_target_user(args: list[str], default_user_id: int, cfg: Config, require_admin: bool) -> int:
+    if not args:
+        return default_user_id
+    if not require_admin:
+        raise ValueError("Укажи только ID нарушения. Для чужого долга нужна роль админа.")
+    target = int(args[0])
+    if target not in cfg.allowed_user_ids:
+        raise ValueError("user_id должен быть из белого списка.")
+    return target
+
+
 @allowed_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.bot_data["config"]
@@ -811,6 +929,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/panel - админ-панель\n"
         "/stats - моя статистика\n"
         "/stats_other - статистика партнера\n"
+        "/violations - мои открытые нарушения\n"
+        "/pay <id> - закрыть нарушение\n"
+        "/payall - закрыть все мои нарушения\n"
         "/bank - банк по штрафам\n"
         "/myid - показать мой Telegram ID\n"
         "/help - справка по формату загрузки"
@@ -1018,6 +1139,135 @@ async def today_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 @allowed_only
+async def violations_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["config"]
+    db: DB = context.bot_data["db"]
+    caller_id = update.effective_user.id
+    args = context.args or []
+
+    target_id = caller_id
+    if args:
+        if caller_id not in cfg.admin_user_ids:
+            await update.message.reply_text("Только админ может смотреть нарушения другого пользователя.")
+            return
+        try:
+            target_id = parse_target_user(args, caller_id, cfg, require_admin=True)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+
+    rows = db.get_open_violations(target_id)
+    if not rows:
+        await update.message.reply_text("Открытых нарушений нет.")
+        return
+    lines = [f"Открытые нарушения {db.get_user_name(target_id)} ({target_id}):"]
+    for row in rows:
+        dt = datetime.fromisoformat(row["created_at"]).astimezone(cfg.timezone)
+        lines.append(
+            f"ID {row['id']} | {dt.strftime('%Y-%m-%d %H:%M')} | {row['fine_amount']} руб | {row['action_text']}"
+        )
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=violations_keyboard(rows, target_id),
+    )
+
+
+@allowed_only
+async def pay_violation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["config"]
+    db: DB = context.bot_data["db"]
+    caller_id = update.effective_user.id
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /pay <violation_id> [user_id для админа]")
+        return
+
+    try:
+        violation_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("violation_id должен быть числом.")
+        return
+
+    target_id = caller_id
+    if len(args) > 1:
+        if caller_id not in cfg.admin_user_ids:
+            await update.message.reply_text("Только админ может закрывать чужие нарушения.")
+            return
+        try:
+            target_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("user_id должен быть числом.")
+            return
+        if target_id not in cfg.allowed_user_ids:
+            await update.message.reply_text("user_id должен быть из белого списка.")
+            return
+
+    ok = db.pay_violation(target_id, violation_id)
+    if not ok:
+        await update.message.reply_text("Нарушение не найдено, уже закрыто или не принадлежит пользователю.")
+        return
+    await update.message.reply_text(f"Нарушение ID {violation_id} закрыто.")
+
+
+@allowed_only
+async def pay_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["config"]
+    db: DB = context.bot_data["db"]
+    caller_id = update.effective_user.id
+    args = context.args or []
+
+    target_id = caller_id
+    if args:
+        if caller_id not in cfg.admin_user_ids:
+            await update.message.reply_text("Только админ может закрывать чужие нарушения.")
+            return
+        try:
+            target_id = parse_target_user(args, caller_id, cfg, require_admin=True)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+
+    count, total = db.pay_all_violations(target_id)
+    if count == 0:
+        await update.message.reply_text("Открытых нарушений нет.")
+        return
+    await update.message.reply_text(
+        f"Закрыто нарушений: {count}\nСумма закрытого долга: {total} руб."
+    )
+
+
+@allowed_only
+async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    cfg: Config = context.bot_data["config"]
+    db: DB = context.bot_data["db"]
+    caller_id = query.from_user.id
+
+    try:
+        _, violation_id_raw, target_user_raw = (query.data or "").split(":")
+        violation_id = int(violation_id_raw)
+        target_user_id = int(target_user_raw)
+    except (ValueError, AttributeError):
+        await query.message.reply_text("Некорректная кнопка оплаты.")
+        return
+
+    if target_user_id not in cfg.allowed_user_ids:
+        await query.message.reply_text("Некорректный пользователь.")
+        return
+    if caller_id != target_user_id and caller_id not in cfg.admin_user_ids:
+        await query.message.reply_text("Можно закрывать только свои нарушения (или быть админом).")
+        return
+
+    ok = db.pay_violation(target_user_id, violation_id)
+    if not ok:
+        await query.message.reply_text("Нарушение уже закрыто или не найдено.")
+        return
+
+    await query.message.reply_text(f"Нарушение ID {violation_id} закрыто.")
+
+
+@allowed_only
 @admin_only
 async def bank(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: DB = context.bot_data["db"]
@@ -1180,13 +1430,24 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def sunday_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["config"]
+    db: DB = context.application.bot_data["db"]
+    now_local = datetime.now(cfg.timezone)
+    week_start_local = datetime.combine(
+        (now_local.date() - timedelta(days=now_local.weekday())),
+        time.min,
+        tzinfo=cfg.timezone,
+    )
     for uid in cfg.allowed_user_ids:
+        weekly_table = format_weekly_violations_table(
+            db, uid, week_start_local, now_local, cfg.timezone
+        )
         await context.bot.send_message(
             chat_id=uid,
             text=(
                 "Напоминание: сегодня воскресенье 19:00, проверь календарь на следующую неделю.\n"
                 "Если расписание изменилось, загрузи новый через /upload.\n"
-                "Если без изменений, можно ничего не загружать."
+                "Если без изменений, можно ничего не загружать.\n\n"
+                f"{weekly_table}"
             ),
         )
 
@@ -1278,8 +1539,12 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", stats_me))
     application.add_handler(CommandHandler("stats_other", stats_other))
     application.add_handler(CommandHandler("today", today_tasks))
+    application.add_handler(CommandHandler("violations", violations_list))
+    application.add_handler(CommandHandler("pay", pay_violation_cmd))
+    application.add_handler(CommandHandler("payall", pay_all_cmd))
     application.add_handler(CommandHandler("bank", bank))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_receive_fine))
+    application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(panel_callbacks, pattern=r"^panel:"))
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
 
