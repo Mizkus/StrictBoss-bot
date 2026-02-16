@@ -190,7 +190,7 @@ class DB:
     def clear_week_events(self, user_id: int, week_start: str) -> None:
         cur = self.conn.cursor()
         cur.execute(
-            "DELETE FROM events WHERE user_id=? AND week_start=? AND status='pending' AND source='manual'",
+            "DELETE FROM events WHERE user_id=? AND week_start=? AND status IN ('pending','no_track') AND source='manual'",
             (user_id, week_start),
         )
         self.conn.commit()
@@ -200,14 +200,23 @@ class DB:
         user_id: int,
         events: Iterable[tuple[datetime, Optional[datetime], str]],
         source: str = "manual",
+        status: str = "pending",
     ) -> list[int]:
         cur = self.conn.cursor()
         ids: list[int] = []
         for event_at, end_at, action in events:
             week_start = (event_at.date() - timedelta(days=event_at.weekday())).isoformat()
             cur.execute(
-                "INSERT INTO events (user_id, event_at, end_at, action_text, week_start, source) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, event_at.isoformat(), end_at.isoformat() if end_at else None, action, week_start, source),
+                "INSERT INTO events (user_id, event_at, end_at, action_text, week_start, source, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    event_at.isoformat(),
+                    end_at.isoformat() if end_at else None,
+                    action,
+                    week_start,
+                    source,
+                    status,
+                ),
             )
             ids.append(cur.lastrowid)
         self.conn.commit()
@@ -242,7 +251,7 @@ class DB:
     def has_active_calendar(self, user_id: int, now: datetime) -> bool:
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT 1 FROM events WHERE user_id=? AND status='pending' AND event_at >= ? LIMIT 1",
+            "SELECT 1 FROM events WHERE user_id=? AND status IN ('pending','no_track') AND event_at >= ? LIMIT 1",
             (user_id, now.isoformat()),
         )
         return cur.fetchone() is not None
@@ -252,7 +261,7 @@ class DB:
         cur.execute(
             """
             SELECT * FROM events
-            WHERE user_id=? AND status='pending' AND event_at >= ? AND event_at < ?
+            WHERE user_id=? AND status IN ('pending','no_track') AND event_at >= ? AND event_at < ?
             ORDER BY event_at
             """,
             (user_id, day_start.isoformat(), day_end.isoformat()),
@@ -405,6 +414,17 @@ class DB:
         )
         self.conn.commit()
         return count, total
+
+    def pay_violation_any(self, violation_id: int) -> Optional[int]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT user_id, paid FROM violations WHERE id=?", (violation_id,))
+        row = cur.fetchone()
+        if not row or int(row["paid"]) == 1:
+            return None
+        target_user = int(row["user_id"])
+        cur.execute("UPDATE violations SET paid=1 WHERE id=? AND paid=0", (violation_id,))
+        self.conn.commit()
+        return target_user if cur.rowcount == 1 else None
 
     def get_user_name(self, user_id: int) -> str:
         cur = self.conn.cursor()
@@ -807,6 +827,15 @@ def deduplicate_events(
     return sorted(by_key.values(), key=lambda x: (x[0], x[2]))
 
 
+def parse_action_flags(action: str) -> tuple[str, bool]:
+    cleaned = action.strip()
+    lower = cleaned.lower()
+    if lower.startswith("[nt]"):
+        cleaned = cleaned[4:].strip()
+        return (cleaned or "Событие"), True
+    return cleaned, False
+
+
 def filter_ics_to_actual_week(
     events: list[tuple[datetime, Optional[datetime], str]], now: datetime, tz: ZoneInfo
 ) -> list[tuple[datetime, Optional[datetime], str]]:
@@ -879,6 +908,7 @@ def panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Установить штраф", callback_data="panel:set_fine")],
+            [InlineKeyboardButton("Отменить штраф", callback_data="panel:cancel_fine")],
             [InlineKeyboardButton("Показать банк", callback_data="panel:bank")],
             [InlineKeyboardButton("Моя статистика", callback_data="panel:my_stats")],
             [InlineKeyboardButton("Статистика партнера", callback_data="panel:other_stats")],
@@ -978,6 +1008,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Пример:\n"
         "2026-02-16 08:00 | Зарядка\n"
         "16.02 09:00-10:30 | Тренировка\n\n"
+        "Если в начале действия поставить [nt], событие не будет отправляться на проверку.\n"
         "Если отправишь несколько недель сразу, бот сам разложит их по неделям.\n"
         "Если расписание не изменилось, можно не загружать заново."
     )
@@ -1004,15 +1035,38 @@ async def save_uploaded_events(
     cfg: Config = context.bot_data["config"]
     db: DB = context.bot_data["db"]
     user_id = update.effective_user.id
-    deduped_events = deduplicate_events(events)
+    normalized_events: list[tuple[datetime, Optional[datetime], str, bool]] = []
+    for event_dt, end_dt, action in events:
+        clean_action, no_track = parse_action_flags(action)
+        normalized_events.append((event_dt, end_dt, clean_action, no_track))
+
+    deduped_events = deduplicate_events(
+        [(event_dt, end_dt, action) for event_dt, end_dt, action, _ in normalized_events]
+    )
+    no_track_keys = {
+        (event_dt.isoformat(), action)
+        for event_dt, _end_dt, action, is_no_track in normalized_events
+        if is_no_track
+    }
     grouped = split_events_by_week(deduped_events)
 
     week_count = 0
     for week_start, week_events in sorted(grouped.items()):
         db.clear_week_events(user_id, week_start)
-        event_ids = db.insert_events(user_id, week_events)
-        for event_id, (event_dt, _end_dt, action) in zip(event_ids, week_events):
+        track_events: list[tuple[datetime, Optional[datetime], str]] = []
+        no_track_events: list[tuple[datetime, Optional[datetime], str]] = []
+        for event_dt, end_dt, action in week_events:
+            key = (event_dt.isoformat(), action)
+            if key in no_track_keys:
+                no_track_events.append((event_dt, end_dt, action))
+            else:
+                track_events.append((event_dt, end_dt, action))
+
+        event_ids = db.insert_events(user_id, track_events, status="pending")
+        for event_id, (event_dt, _end_dt, action) in zip(event_ids, track_events):
             schedule_event_notification(context.application, cfg, event_id, event_dt, action)
+        if no_track_events:
+            db.insert_events(user_id, no_track_events, status="no_track")
         week_count += 1
 
     await update.message.reply_text(
@@ -1070,6 +1124,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @admin_only
 async def set_fine_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting_fine"] = True
+    context.user_data["awaiting_cancel_fine"] = False
     await update.message.reply_text("Отправь новую стоимость штрафа в рублях (целое число).")
 
 
@@ -1092,10 +1147,55 @@ async def set_fine_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 @allowed_only
 @admin_only
-async def maybe_receive_fine(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.get("awaiting_fine"):
+async def cancel_fine_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: DB = context.bot_data["db"]
+    cfg: Config = context.bot_data["config"]
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if not parts:
+        await update.message.reply_text("Формат: <violation_id> [user_id]")
         return
-    await set_fine_receive(update, context)
+    try:
+        violation_id = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("violation_id должен быть числом.")
+        return
+
+    target_id: Optional[int] = None
+    if len(parts) > 1:
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("user_id должен быть числом.")
+            return
+        if target_id not in cfg.allowed_user_ids:
+            await update.message.reply_text("user_id должен быть из белого списка.")
+            return
+        ok = db.pay_violation(target_id, violation_id)
+        if not ok:
+            await update.message.reply_text("Штраф не найден, уже закрыт или не принадлежит user_id.")
+            return
+    else:
+        target_id = db.pay_violation_any(violation_id)
+        if target_id is None:
+            await update.message.reply_text("Штраф не найден или уже закрыт.")
+            return
+
+    context.user_data["awaiting_cancel_fine"] = False
+    await update.message.reply_text(
+        f"Штраф по нарушению ID {violation_id} отменён для пользователя {target_id}."
+    )
+
+
+@allowed_only
+@admin_only
+async def maybe_receive_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("awaiting_fine"):
+        await set_fine_receive(update, context)
+        return
+    if context.user_data.get("awaiting_cancel_fine"):
+        await cancel_fine_receive(update, context)
+        return
 
 
 @allowed_only
@@ -1298,7 +1398,16 @@ async def panel_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
     if data == "panel:set_fine":
         context.user_data["awaiting_fine"] = True
+        context.user_data["awaiting_cancel_fine"] = False
         await query.message.reply_text("Отправь новую сумму штрафа числом.")
+        return
+    if data == "panel:cancel_fine":
+        context.user_data["awaiting_fine"] = False
+        context.user_data["awaiting_cancel_fine"] = True
+        await query.message.reply_text(
+            "Отправь ID нарушения для отмены штрафа.\n"
+            "Формат: <violation_id> [user_id]"
+        )
         return
     if data == "panel:bank":
         rows = db.get_bank()
@@ -1399,11 +1508,15 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     ok = db.mark_review(event_id, query.from_user.id, compliant)
     if not ok:
-        await query.message.reply_text("Это событие уже оценено.")
+        await query.edit_message_text("Это событие уже оценено.")
         return
 
     action = event["action_text"]
     window = format_event_window(event["event_at"], event["end_at"], cfg.timezone)
+    base_text = (
+        f"Проверка события {db.get_user_name(owner_id)}:\n"
+        f"{window} - {action}\n"
+    )
     if compliant:
         await context.bot.send_message(
             chat_id=owner_id,
@@ -1412,7 +1525,7 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"{window} - {action}"
             ),
         )
-        await query.message.reply_text("Отметка сохранена: соблюдает график.")
+        await query.edit_message_text(base_text + "✅ Подтверждено: соблюдает график.")
         return
 
     fine = db.get_fine()
@@ -1425,7 +1538,9 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Нужно пополнить счёт и закрыть долг."
         ),
     )
-    await query.message.reply_text("Нарушение зафиксировано.")
+    await query.edit_message_text(
+        base_text + f"❌ Подтверждено: нарушение. Штраф {fine} руб."
+    )
 
 
 async def sunday_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1543,7 +1658,7 @@ def main() -> None:
     application.add_handler(CommandHandler("pay", pay_violation_cmd))
     application.add_handler(CommandHandler("payall", pay_all_cmd))
     application.add_handler(CommandHandler("bank", bank))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_receive_fine))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_receive_admin_input))
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(panel_callbacks, pattern=r"^panel:"))
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review:"))
